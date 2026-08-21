@@ -15,13 +15,23 @@ Run with: python3 mcp_server.py
 Then point any MCP client (Claude Desktop config, Claude Code, etc.) at it.
 """
 
+import sys
+import os
+
 import uuid
 from typing import Any, Dict
 
 from mcp.server.mcpserver import MCPServer
 from langgraph.types import Command
 
-from spec_agent import app  # the compiled graph from spec_agent.py
+# parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# if parent_dir not in sys.path:
+#    sys.path.append(parent_dir)
+
+import sys
+
+print("PYTHON PATH:", sys.path)
+from agent.spec_agent import app  # the compiled graph from spec_agent.py
 
 mcp = MCPServer("spec-agent")
 
