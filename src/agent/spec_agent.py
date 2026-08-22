@@ -21,6 +21,11 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from langchain_anthropic import ChatAnthropic
+import os
+from anthropic import Anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging / tracing setup
@@ -60,9 +65,9 @@ elif _tracing_enabled:
 else:
     logger.info("LangSmith tracing disabled (set LANGSMITH_TRACING=true to enable)")
 
-MAX_REVISIONS = 3       # hard cap on plan-revision loops
+MAX_REVISIONS = 3  # hard cap on plan-revision loops
 MAX_CODE_REVISIONS = 3  # hard cap on code-validation retry loops
-MAX_PARSE_RETRIES = 2   # in-node retries for malformed JSON, before escalating
+MAX_PARSE_RETRIES = 2  # in-node retries for malformed JSON, before escalating
 
 llm = ChatAnthropic(model="claude-sonnet-4-6")
 
@@ -182,7 +187,9 @@ def generate_plan(state: AgentState) -> AgentState:
             last_error = str(exc)
             logger.warning(
                 "generate_plan attempt %d/%d failed schema/JSON validation: %s",
-                attempt + 1, MAX_PARSE_RETRIES + 1, last_error,
+                attempt + 1,
+                MAX_PARSE_RETRIES + 1,
+                last_error,
             )
             prompt = f"""{base_prompt}
 
@@ -199,21 +206,29 @@ respond again."""
         logger.info("plan generated and schema-validated (%d files)", len(plan.files))
         return {"plan": plan.model_dump(), "error": None}
 
-    logger.error("generate_plan exhausted %d retries: %s", MAX_PARSE_RETRIES + 1, last_error)
-    return {"error": f"generate_plan produced invalid output after retries: {last_error}"}
+    logger.error(
+        "generate_plan exhausted %d retries: %s", MAX_PARSE_RETRIES + 1, last_error
+    )
+    return {
+        "error": f"generate_plan produced invalid output after retries: {last_error}"
+    }
 
 
 def human_review(state: AgentState) -> AgentState:
     _trace("human_review", state)
 
-    decision = interrupt({
-        "plan": state["plan"],
-        "revision_count": state.get("revision_count", 0),
-        "message": "Review this plan. Respond with approve, or reject+feedback.",
-    })
+    decision = interrupt(
+        {
+            "plan": state["plan"],
+            "revision_count": state.get("revision_count", 0),
+            "message": "Review this plan. Respond with approve, or reject+feedback.",
+        }
+    )
 
     if decision.get("action") == "approve":
-        logger.info("plan approved after %d revision(s)", state.get("revision_count", 0))
+        logger.info(
+            "plan approved after %d revision(s)", state.get("revision_count", 0)
+        )
         return {"approved": True}
 
     feedback = (decision.get("feedback") or "").strip()
@@ -227,7 +242,9 @@ def human_review(state: AgentState) -> AgentState:
     history = state.get("feedback_history", []) + [feedback]
     new_count = state.get("revision_count", 0) + 1
 
-    logger.info("plan rejected (revision %d/%d): %s", new_count, MAX_REVISIONS, feedback[:80])
+    logger.info(
+        "plan rejected (revision %d/%d): %s", new_count, MAX_REVISIONS, feedback[:80]
+    )
 
     return {
         "approved": False,
@@ -274,7 +291,9 @@ def escalate(state: AgentState) -> AgentState:
     }
 
 
-def _build_code_prompt(spec: str, plan: Dict[str, Any], validation_error: Optional[str] = None) -> str:
+def _build_code_prompt(
+    spec: str, plan: Dict[str, Any], validation_error: Optional[str] = None
+) -> str:
     plan_json = json.dumps(plan, indent=2)
     error_block = ""
     if validation_error:
@@ -320,7 +339,9 @@ def generate_code(state: AgentState) -> AgentState:
         logger.error("generate_code called with no plan in state")
         return {"error": "generate_code called with no approved plan in state"}
 
-    prompt = _build_code_prompt(state["spec"], state["plan"], state.get("validation_error"))
+    prompt = _build_code_prompt(
+        state["spec"], state["plan"], state.get("validation_error")
+    )
 
     try:
         response = llm.invoke(prompt)
@@ -402,7 +423,9 @@ def _validate_dotnet_project(tmp_path: Path, files: Dict[str, str]) -> List[str]
         cwd=str(tmp_path),
     )
     if result.returncode != 0:
-        return [f"dotnet build failed:\n{result.stdout.strip()}\n{result.stderr.strip()}"]
+        return [
+            f"dotnet build failed:\n{result.stdout.strip()}\n{result.stderr.strip()}"
+        ]
     return []
 
 
@@ -461,12 +484,15 @@ def validate_code(state: AgentState) -> AgentState:
     if unvalidated:
         logger.warning(
             "validate_code: no validator available for %d file(s), written but unchecked: %s",
-            len(unvalidated), unvalidated,
+            len(unvalidated),
+            unvalidated,
         )
 
     if errors:
         error_summary = "\n".join(errors)
-        logger.warning("validate_code found %d error(s):\n%s", len(errors), error_summary)
+        logger.warning(
+            "validate_code found %d error(s):\n%s", len(errors), error_summary
+        )
         return {
             "validation_error": error_summary,
             "code_revision_count": state.get("code_revision_count", 0) + 1,
@@ -479,7 +505,9 @@ def validate_code(state: AgentState) -> AgentState:
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
-def route_after_review(state: AgentState) -> Literal["generate_code", "generate_plan", "escalate"]:
+def route_after_review(
+    state: AgentState,
+) -> Literal["generate_code", "generate_plan", "escalate"]:
     if state.get("approved"):
         return "generate_code"
     if state.get("revision_count", 0) >= MAX_REVISIONS:
@@ -501,7 +529,9 @@ def route_after_code(state: AgentState) -> Literal["escalate", "validate_code"]:
     return "validate_code"
 
 
-def route_after_validation(state: AgentState) -> Literal["generate_code", "escalate", "__end__"]:
+def route_after_validation(
+    state: AgentState,
+) -> Literal["generate_code", "escalate", "__end__"]:
     if not state.get("validation_error"):
         return END
     if state.get("code_revision_count", 0) >= MAX_CODE_REVISIONS:
@@ -530,6 +560,12 @@ checkpointer = MemorySaver()
 app = graph.compile(checkpointer=checkpointer)
 
 
+def read_spec_file(file_path: str) -> str:
+    """Read the spec from a file, stripping any leading/trailing whitespace."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
 # ---------------------------------------------------------------------------
 # Example usage
 # ---------------------------------------------------------------------------
@@ -543,8 +579,7 @@ if __name__ == "__main__":
     }
 
     initial_state: AgentState = {
-        "spec": "Build a REST endpoint for user signup with email+password, "
-                "return a JWT on success.",
+        "spec": read_spec_file("C:\\temp\\spec.md"),
         "plan": None,
         "feedback": None,
         "feedback_history": [],
