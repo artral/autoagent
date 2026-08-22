@@ -356,6 +356,20 @@ def generate_code(state: AgentState) -> AgentState:
     return {"code": code_text, "error": None}
 
 
+def _strip_code_fence(content: str) -> str:
+    """Remove a leading/trailing markdown code fence line if the model wrapped
+    a file's content in ```lang ... ``` despite being told not to. Without
+    this, a fenced .csproj/.xml/.json file has '```xml' as its literal first
+    line, which breaks any real parser for that format (e.g. dotnet build's
+    XML parser failing with 'Data at the root level is invalid, line 1')."""
+    lines = content.splitlines()
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
 def _parse_code_files(code_text: str) -> Dict[str, str]:
     """Split the '# FILE: <path>' delimited response into {path: contents}.
     Raises ValueError if no file markers are found at all — that's a format
@@ -367,14 +381,16 @@ def _parse_code_files(code_text: str) -> Dict[str, str]:
     for line in code_text.splitlines():
         if line.startswith("# FILE:"):
             if current_path is not None:
-                files[current_path] = "\n".join(current_lines).strip() + "\n"
+                files[current_path] = _strip_code_fence(
+                    "\n".join(current_lines).strip()
+                )
             current_path = line.split("# FILE:", 1)[1].strip()
             current_lines = []
         else:
             current_lines.append(line)
 
     if current_path is not None:
-        files[current_path] = "\n".join(current_lines).strip() + "\n"
+        files[current_path] = _strip_code_fence("\n".join(current_lines).strip())
 
     if not files:
         raise ValueError("no '# FILE: <path>' markers found in generated code")
@@ -434,7 +450,7 @@ def _validate_dotnet_project(tmp_path: Path, files: Dict[str, str]) -> List[str]
 _PER_FILE_VALIDATORS = {
     ".py": _validate_python_file,
 }
-_DOTNET_EXTENSIONS = {".cs", ".csproj"}
+_DOTNET_EXTENSIONS = {".cs", ".csproj", ".sln", ".fs", ".vb", ".json", ".config"}
 
 
 def validate_code(state: AgentState) -> AgentState:
