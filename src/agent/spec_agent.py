@@ -6,6 +6,9 @@ Hardened per ai-agents-architect sharp edges:
 - Tracing/logging on every node transition
 - Defensive parsing of LLM outputs
 - Tool errors surfaced back into state, not swallowed
+
+Supported validation targets: Python, .NET/C#, Node.js/TypeScript (incl.
+Knex migrations), and MS SQL (T-SQL stored procedures via sqlfluff).
 """
 
 import json
@@ -13,7 +16,9 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import TypedDict, Literal, Optional, List, Dict, Any
 from pydantic import BaseModel, ValidationError, Field
@@ -21,8 +26,6 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from langchain_anthropic import ChatAnthropic
-import os
-from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -103,6 +106,8 @@ class AgentState(TypedDict):
     code_revision_count: int
     validation_error: Optional[str]
     error: Optional[str]  # surfaced tool/parse errors, not swallowed
+    run_id: Optional[str]  # stable id for this run, assigned once
+    output_dir: Optional[str]  # set once validate_code writes a durable copy
 
 
 def _trace(node_name: str, state: AgentState) -> None:
@@ -168,6 +173,13 @@ def _parse_json_response(raw_text: str) -> Dict[str, Any]:
 def generate_plan(state: AgentState) -> AgentState:
     _trace("generate_plan", state)
 
+    # Assign a stable run_id once, on first entry — used later by
+    # validate_code to write a persistent output folder. Revisions re-enter
+    # this node, so only set it if it isn't already present.
+    run_id_update: Dict[str, Any] = {}
+    if not state.get("run_id"):
+        run_id_update["run_id"] = uuid.uuid4().hex[:12]
+
     base_prompt = _build_plan_prompt(state["spec"], state.get("feedback_history", []))
     prompt = base_prompt
     last_error: Optional[str] = None
@@ -201,16 +213,17 @@ respond again."""
             continue
         except Exception as exc:
             logger.error("generate_plan failed (non-retryable): %s", exc)
-            return {"error": f"generate_plan failed: {exc}"}
+            return {**run_id_update, "error": f"generate_plan failed: {exc}"}
 
         logger.info("plan generated and schema-validated (%d files)", len(plan.files))
-        return {"plan": plan.model_dump(), "error": None}
+        return {**run_id_update, "plan": plan.model_dump(), "error": None}
 
     logger.error(
         "generate_plan exhausted %d retries: %s", MAX_PARSE_RETRIES + 1, last_error
     )
     return {
-        "error": f"generate_plan produced invalid output after retries: {last_error}"
+        **run_id_update,
+        "error": f"generate_plan produced invalid output after retries: {last_error}",
     }
 
 
@@ -318,7 +331,7 @@ APPROVED PLAN (strict JSON — implement exactly these files/functions):
 {error_block}
 INSTRUCTIONS:
 - Implement every file listed in the plan's "files" array, using whatever
-  language/framework the spec calls for (Python, C#/.NET, JS/TS, etc.).
+  language/framework the spec calls for (Python, C#/.NET, Node.js/TS, etc.).
 - Match the function signatures given in the plan where practical.
 - Include brief inline comments only where logic is non-obvious.
 - Do NOT add features, files, or functions not present in the plan.
@@ -326,10 +339,18 @@ INSTRUCTIONS:
 - If the target is a compiled/project-based language (e.g. .NET), include the
   project file itself (e.g. a minimal .csproj) as one of the generated files —
   it cannot be validated without one.
+- If the spec calls for Knex.js migrations, write them as standard Knex
+  migration files (exports.up / exports.down) targeting the "mssql" client.
+- If the spec calls for MS SQL stored procedures, write each as its own
+  .sql file containing a single CREATE (OR ALTER) PROCEDURE statement,
+  using standard T-SQL syntax.
 
 OUTPUT FORMAT:
 For each file, output a header line `# FILE: <path>` followed by the
-complete file contents. No prose outside of code comments."""
+complete file contents. No prose outside of code comments. Do NOT wrap
+any file's content in markdown code fences (no ``` anywhere in the output,
+under any circumstances) — the raw file content must start on the line
+immediately after the `# FILE:` header."""
 
 
 def generate_code(state: AgentState) -> AgentState:
@@ -359,9 +380,10 @@ def generate_code(state: AgentState) -> AgentState:
 def _strip_code_fence(content: str) -> str:
     """Remove a leading/trailing markdown code fence line if the model wrapped
     a file's content in ```lang ... ``` despite being told not to. Without
-    this, a fenced .csproj/.xml/.json file has '```xml' as its literal first
-    line, which breaks any real parser for that format (e.g. dotnet build's
-    XML parser failing with 'Data at the root level is invalid, line 1')."""
+    this, a fenced .csproj/.xml/.json/.sql file has '```xml' (etc.) as its
+    literal first line, which breaks any real parser for that format (e.g.
+    dotnet build's XML parser failing with 'Data at the root level is
+    invalid, line 1', or sqlfluff failing to parse a fenced .sql file)."""
     lines = content.splitlines()
     if lines and lines[0].lstrip().startswith("```"):
         lines = lines[1:]
@@ -381,8 +403,8 @@ def _parse_code_files(code_text: str) -> Dict[str, str]:
     for line in code_text.splitlines():
         if line.startswith("# FILE:"):
             if current_path is not None:
-                files[current_path] = _strip_code_fence(
-                    "\n".join(current_lines).strip()
+                files[current_path] = (
+                    _strip_code_fence("\n".join(current_lines).strip()) + "\n"
                 )
             current_path = line.split("# FILE:", 1)[1].strip()
             current_lines = []
@@ -390,7 +412,7 @@ def _parse_code_files(code_text: str) -> Dict[str, str]:
             current_lines.append(line)
 
     if current_path is not None:
-        files[current_path] = _strip_code_fence("\n".join(current_lines).strip())
+        files[current_path] = _strip_code_fence("\n".join(current_lines).strip()) + "\n"
 
     if not files:
         raise ValueError("no '# FILE: <path>' markers found in generated code")
@@ -398,6 +420,9 @@ def _parse_code_files(code_text: str) -> Dict[str, str]:
     return files
 
 
+# ---------------------------------------------------------------------------
+# Per-language validators
+# ---------------------------------------------------------------------------
 def _validate_python_file(file_path: Path) -> Optional[str]:
     """Per-file syntax check — valid for Python since it has no project-level
     compile step. Returns an error string, or None if it passed."""
@@ -408,6 +433,80 @@ def _validate_python_file(file_path: Path) -> Optional[str]:
     )
     if result.returncode != 0:
         return result.stderr.strip()
+    return None
+
+
+def _validate_node_file(file_path: Path) -> Optional[str]:
+    """Syntax-only check for .js files (includes Knex migrations — they're
+    plain Node.js modules, no special Knex-aware validation needed beyond
+    valid JS syntax). Does NOT check module resolution/require() targets,
+    same level of rigor as py_compile: syntax, not semantics."""
+    if shutil.which("node") is None:
+        logger.warning(
+            "node not found on PATH — skipping JS syntax check for %s", file_path
+        )
+        return None
+    result = subprocess.run(
+        ["node", "--check", str(file_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return result.stderr.strip()
+    return None
+
+
+def _validate_typescript_file(file_path: Path) -> Optional[str]:
+    """Syntax/type check for .ts files via tsc. Requires TypeScript to be
+    installed (npm install -g typescript, or locally via npx) — if it's not
+    available, this skips gracefully rather than failing the run, same
+    pattern as the .NET SDK check below."""
+    if shutil.which("tsc") is None:
+        logger.warning(
+            "tsc not found on PATH — skipping TypeScript check for %s "
+            "(install with: npm install -g typescript)",
+            file_path,
+        )
+        return None
+    result = subprocess.run(
+        ["tsc", "--noEmit", "--allowJs", "--target", "es2020", str(file_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return result.stdout.strip() or result.stderr.strip()
+    return None
+
+
+def _validate_sql_file(file_path: Path) -> Optional[str]:
+    """T-SQL syntax check via sqlfluff's 'tsql' dialect — used for MS SQL
+    stored procedures. 'sqlfluff parse' (not 'lint') is used deliberately:
+    parse only fails on genuine syntax errors ('unparsable section'), not
+    style/formatting preferences, which is the right level of strictness
+    to match py_compile/node --check elsewhere in this file.
+    Requires: pip install sqlfluff."""
+    if shutil.which("sqlfluff") is None:
+        logger.warning(
+            "sqlfluff not found — skipping T-SQL syntax check for %s "
+            "(install with: pip install sqlfluff)",
+            file_path,
+        )
+        return None
+    result = subprocess.run(
+        ["sqlfluff", "parse", "--dialect", "tsql", str(file_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # sqlfluff's parse-tree dump on success is noisy; on failure the
+        # useful part is the "==== parsing violations ====" section.
+        output = result.stdout
+        marker = "==== parsing violations ===="
+        return (
+            output[output.index(marker) :].strip()
+            if marker in output
+            else output.strip()
+        )
     return None
 
 
@@ -447,10 +546,16 @@ def _validate_dotnet_project(tmp_path: Path, files: Dict[str, str]) -> List[str]
 
 # Extension -> per-file validator. Anything not listed here has no available
 # validator and is reported as such rather than silently treated as "passed".
+# NOTE: only genuinely language-specific extensions belong here. .json and
+# .config were previously (incorrectly) grouped under .NET — that meant any
+# Node.js project's package.json got silently skipped instead of validated.
 _PER_FILE_VALIDATORS = {
     ".py": _validate_python_file,
+    ".js": _validate_node_file,
+    ".ts": _validate_typescript_file,
+    ".sql": _validate_sql_file,
 }
-_DOTNET_EXTENSIONS = {".cs", ".csproj", ".sln", ".fs", ".vb", ".json", ".config"}
+_DOTNET_PROJECT_EXTENSIONS = {".cs", ".csproj", ".sln", ".fs", ".vb"}
 
 
 def validate_code(state: AgentState) -> AgentState:
@@ -473,7 +578,7 @@ def validate_code(state: AgentState) -> AgentState:
 
     errors: List[str] = []
     unvalidated: List[str] = []
-    has_dotnet_files = any(Path(p).suffix in _DOTNET_EXTENSIONS for p in files)
+    has_dotnet_files = any(Path(p).suffix in _DOTNET_PROJECT_EXTENSIONS for p in files)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
@@ -484,7 +589,7 @@ def validate_code(state: AgentState) -> AgentState:
 
         for rel_path in files:
             suffix = Path(rel_path).suffix
-            if suffix in _DOTNET_EXTENSIONS:
+            if suffix in _DOTNET_PROJECT_EXTENSIONS:
                 continue  # handled once, project-wide, below
             validator = _PER_FILE_VALIDATORS.get(suffix)
             if validator is None:
@@ -514,8 +619,23 @@ def validate_code(state: AgentState) -> AgentState:
             "code_revision_count": state.get("code_revision_count", 0) + 1,
         }
 
-    logger.info("validate_code passed: %d file(s) compiled cleanly", len(files))
-    return {"validation_error": None}
+    # Validation passed — write a durable copy now. Everything above ran
+    # inside the disposable TemporaryDirectory (already cleaned up by this
+    # point); this is a separate, persistent location that survives after
+    # this function returns and the process exits.
+    run_id = state.get("run_id") or "unknown-run"
+    output_dir = Path("generated_output") / run_id
+    for rel_path, contents in files.items():
+        out_path = output_dir / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(contents)
+
+    logger.info(
+        "validate_code passed: %d file(s) compiled cleanly, written to %s",
+        len(files),
+        output_dir,
+    )
+    return {"validation_error": None, "output_dir": str(output_dir)}
 
 
 # ---------------------------------------------------------------------------
@@ -586,16 +706,22 @@ def read_spec_file(file_path: str) -> str:
 # Example usage
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # Spec file path: pass as a CLI arg, or fall back to SPEC_FILE env var,
+    # or default to spec.md in the current directory. This replaces the
+    # previous hardcoded "C:\\temp\\spec.md" so the script runs on any
+    # machine/CI without editing source.
+    spec_path = sys.argv[1] if len(sys.argv) > 1 else os.getenv("SPEC_FILE", "spec.md")
+
     # tags/metadata surface directly in LangSmith's trace filters — e.g.
     # filter all traces tagged "spec-agent" that resulted in an escalation.
     config = {
         "configurable": {"thread_id": "session-1"},
         "tags": ["spec-agent"],
-        "metadata": {"pipeline_version": "v3-validated-code"},
+        "metadata": {"pipeline_version": "v4-multi-lang-validation"},
     }
 
     initial_state: AgentState = {
-        "spec": read_spec_file("C:\\temp\\spec.md"),
+        "spec": read_spec_file(spec_path),
         "plan": None,
         "feedback": None,
         "feedback_history": [],
@@ -605,6 +731,8 @@ if __name__ == "__main__":
         "code_revision_count": 0,
         "validation_error": None,
         "error": None,
+        "run_id": None,
+        "output_dir": None,
     }
 
     result = app.invoke(initial_state, config=config)
@@ -617,5 +745,6 @@ if __name__ == "__main__":
     if result.get("error"):
         print("ESCALATED / FAILED:", result["error"])
     else:
-        print("Generated code:")
+        print(f"Success. Files written to: {result.get('output_dir')}")
+        print("Generated code (raw):")
         print(result["code"])

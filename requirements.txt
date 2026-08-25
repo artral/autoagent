@@ -2,3 +2,5 @@ langgraph>=1.2.10
 langchain-anthropic>=1.5.3
 pydantic>=2.13.4
 mcp>=2.0.0
+python-dotenv>=1.0.0
+sqlfluff>=3.0.0
